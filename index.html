@@ -41,6 +41,7 @@
   .bottom button { margin:0; padding:18px 8px; font-size:18px; }
   .bottom .arrow { flex:0 0 72px; }
   .bottom .row button { padding:14px 4px; font-size:16px; }
+  .bottom button.hold { background:#3a4560; touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
   .order { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
   .order span { font-size:11px; padding:2px 8px; border-radius:99px; background:#2a3142; color:var(--sub); }
   .order span.on { background:var(--accent); color:#2a1a05; font-weight:700; }
@@ -67,6 +68,8 @@ const GRAV = -25;                  // 重力（見ためが軽すぎないよう
 const DT = 1 / 120;                // 物理の 1 ステップ
 let HVAR = 0.03;                 // ブロックの高さのばらつき（±3%）。高いブロックが重さを受け、低いブロックはゆるくなる
 let FRICTION = 0.45;
+const LIFT_MAX = 0.2;               // 押す・引くときに、指の上下でブロックを上下できる幅（元の高さから ±）。上下にゆらすとタワーも揺れる
+const ROT_SPEED = 50 * Math.PI / 180;   // 置くときの回転ボタンを押している間の回る速さ（1秒あたり）
 const FINGER_VMAX = 25;             // 指についていく速さの上限（1秒あたり）。ふつうに動かすぶんには指とぴったり同じに動く
 let JITTER = 0.08;                 // 最初に積むときのずれ（長さ方向）。きっちりそろっていないぶん崩れやすい
 const FALL_DROP = 0.75 * BH;       // ターン開始時からこれ以上下がったブロックがあれば「崩れた」
@@ -280,7 +283,8 @@ let screen = "loading";   // loading / menu / connecting / lobby / game
 let myId = 0, curId = 0, moves = 0, players = [], order = [];
 let phase = "idle";       // pull / place / settle / fallen / wait / watch / over
 let sel = -1, held = -1, viewSel = -1, phaseT = 0, quietT = 0;
-let drag = null;          // { axis, off0, target, dir:{x,y}, ppu, sx, sy }
+let drag = null;          // { axis, off0, target, ty, y0, A, U, det, sx, sy } 押す・引くときの指
+let rotHold = 0;          // 回転ボタンを押している向き（+1 左回り / -1 右回り）
 let place = null;         // { info, k, pose, tx, ty, tz } 置き場の候補と、指で持っている目標の位置
 let turnPos = [], baseY = [];
 let overInfo = null, errMsg = "", toastMsg = "", toastT = 0, lastSend = 0;
@@ -323,7 +327,8 @@ function physStep() {
     const va = v.x * drag.axis.x + v.z * drag.axis.z;
     // 指の位置へ 1 ステップで着く速さにする（指は強いので、キツいブロックでも動く。そのぶんタワーを引きずる）
     const want = Math.max(-FINGER_VMAX, Math.min(FINGER_VMAX, (drag.target - off) / DT));
-    b.setLinvel({ x: v.x + drag.axis.x * (want - va), y: v.y, z: v.z + drag.axis.z * (want - va) }, true);
+    const vy = drag.ty == null ? v.y : Math.max(-FINGER_VMAX, Math.min(FINGER_VMAX, (drag.ty - p.y) / DT));   // 上下も指と同じに
+    b.setLinvel({ x: v.x + drag.axis.x * (want - va), y: vy, z: v.z + drag.axis.z * (want - va) }, true);
   }
   if (phase === "carry") {   // 抜いたブロックを、タワーの上（少し浮かせた所）まで自動で運ぶ
     const b = bodies[held], p = b.translation(), q = b.rotation(), t = place.pose;
@@ -339,6 +344,11 @@ function physStep() {
     const vm = Math.hypot(vx, vy, vz);
     if (vm > FINGER_VMAX) { vx *= FINGER_VMAX / vm; vy *= FINGER_VMAX / vm; vz *= FINGER_VMAX / vm; }
     b.setLinvel({ x: vx, y: vy, z: vz }, true);
+    if (rotHold) {   // 回転ボタンを押している間だけ、少しずつ回す
+      const q = b.rotation();
+      const r = new THREE.Quaternion(q.x, q.y, q.z, q.w).premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotHold * ROT_SPEED * DT));
+      b.setRotation({ x: r.x, y: r.y, z: r.z, w: r.w }, true);
+    }
   }
   world.step();
   phaseT += DT;
@@ -405,13 +415,6 @@ function moveSlot(dir) {
   place.tx = place.pose.x; place.tz = place.pose.z; place.ty = Math.max(place.ty, hoverY());
   bodies[held].setRotation(place.pose.q, true);
 }
-// 回す：90度向きを変える（持ち上げてから回すと安全）
-function turnHeld() {
-  if (phase !== "place") return;
-  const q = bodies[held].rotation();
-  const r = new THREE.Quaternion(q.x, q.y, q.z, q.w).premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2));
-  bodies[held].setRotation({ x: r.x, y: r.y, z: r.z, w: r.w }, true);
-}
 // 離す：重力を戻す。崩れたかの判定は、真下の面の上に乗った高さを基準にする
 function dropHeld() {
   if (phase !== "place") return;
@@ -423,7 +426,7 @@ function dropHeld() {
     if (hit) surf = Math.max(surf, p.y - hit.toi);
   }
   baseY[held] = surf + heights[held] / 2;
-  phase = "settle"; phaseT = 0; quietT = 0; place = null;
+  phase = "settle"; phaseT = 0; quietT = 0; place = null; rotHold = 0;
   renderUI();
 }
 
@@ -440,15 +443,18 @@ function toScreen(v) { const p = v.clone().project(camera); return { x: (p.x + 1
 function startDrag(x, y) {
   const b = bodies[sel], p = b.translation(), o = turnPos[sel], axis = axisOf(sel);
   const c = new THREE.Vector3(p.x, p.y, p.z);
-  const s0 = toScreen(c), s1 = toScreen(c.clone().add(axis));
-  let dx = s1.x - s0.x, dy = s1.y - s0.y, ppu = Math.hypot(dx, dy);
-  if (ppu < 22) {   // ブロックがこちらを向いているときは、上へなぞる = 奥へ押す
+  const s0 = toScreen(c), s1 = toScreen(c.clone().add(axis)), s2 = toScreen(c.clone().add(new THREE.Vector3(0, 1, 0)));
+  let A = { x: s1.x - s0.x, y: s1.y - s0.y };
+  const U = { x: s2.x - s0.x, y: s2.y - s0.y };
+  let det = A.x * U.y - A.y * U.x;
+  // ブロックがこちらを向いている（画面上でほとんど長さがない）ときは、上へなぞる = 奥へ押す。上下には動かさない
+  const facing = Math.hypot(A.x, A.y) < 22 || Math.abs(det) < 300;
+  if (facing) {
     const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.setY(0).normalize();
-    const s = Math.sign(fwd.dot(axis)) || 1; dx = 0; dy = -s; ppu = 40;
-  } else { dx /= ppu; dy /= ppu; }
-  ppu = Math.max(ppu, 30);
+    A = { x: 0, y: -(Math.sign(fwd.dot(axis)) || 1) * 40 }; det = 0;
+  }
   const off0 = (p.x - o.x) * axis.x + (p.z - o.z) * axis.z;
-  drag = { axis, off0, target: off0, dir: { x: dx, y: dy }, ppu, sx: x, sy: y };
+  drag = { axis, off0, target: off0, ty: facing ? null : p.y, py0: p.y, y0: turnPos[sel].y, A, U, det, sx: x, sy: y };
 }
 canvas.addEventListener("pointerdown", e => {
   try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
@@ -475,8 +481,13 @@ canvas.addEventListener("pointermove", e => {
     cam.yaw -= dx * 0.009;
     cam.pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, cam.pitch + dy * 0.006));
   } else if (gesture.type === "push" && drag) {
-    const s = ((e.clientX - drag.sx) * drag.dir.x + (e.clientY - drag.sy) * drag.dir.y) / drag.ppu;
+    // 指の動き = s ×（ブロックの長さ方向 1 の画面上の長さ）+ v ×（上 1 の画面上の長さ）を解いて、両方とも指とぴったり同じに動かす
+    const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+    let s, v = 0;
+    if (drag.det) { s = (dx * drag.U.y - dy * drag.U.x) / drag.det; v = (drag.A.x * dy - drag.A.y * dx) / drag.det; }
+    else s = (dx * drag.A.x + dy * drag.A.y) / (drag.A.x * drag.A.x + drag.A.y * drag.A.y);
     drag.target = Math.max(-BL - 0.5, Math.min(BL + 0.5, drag.off0 + s));
+    if (drag.ty != null) drag.ty = Math.max(drag.y0 - LIFT_MAX, Math.min(drag.y0 + LIFT_MAX, drag.py0 + v));
   } else if (gesture.type === "move" && phase === "place") {
     const h = planeHit(e.clientX, e.clientY, gesture.plane);
     if (h) {
@@ -690,9 +701,9 @@ function renderUI() {
   } else if (screen === "game") {
     const mine = isMine() && phase !== "over";
     const hints = {
-      pull: sel < 0 ? "抜くブロックをタップ。背景をなぞると視点が回る（上下で角度）。2本指で高さとズーム" : "青いブロックを指でなぞって押す・引く。ほかをタップで選び直し",
+      pull: sel < 0 ? "抜くブロックをタップ。背景をなぞると視点が回る（上下で角度）。2本指で高さとズーム" : "青いブロックをなぞると指と同じに動く（押す・引く・少し上下）。ほかをタップで選び直し",
       carry: "上へ運んでいます…",
-      place: "ブロックをなぞると指と同じに動く（上下も）。真上から見るとなぞって奥行きを合わせられる。乗せたら「離す」",
+      place: "ブロックをなぞると指と同じに動く（上下も）。真上から見るとなぞって奥行きを合わせられる。⟲ ⟳ は押している間だけ回る。乗せたら「離す」",
       settle: "揺れがおさまるのを待っています…",
       fallen: "崩れた！",
       wait: "…",
@@ -705,8 +716,8 @@ function renderUI() {
       <div class="cnt">ターン<b>${moves}</b></div><button class="x" data-a="quit">✕</button></div>`;
     if (mine && phase === "place") {
       h += `<div class="bottom p" style="flex-direction:column">
-        <div class="row"><button data-a="left">◀ 置き場</button><button data-a="turn">回す</button><button data-a="right">置き場 ▶</button></div>
-        <div class="row"><button class="main" data-a="drop">離す</button></div>
+        <div class="row"><button data-a="left">◀ 置き場</button><button data-a="right">置き場 ▶</button></div>
+        <div class="row"><button class="hold" data-r="1">⟲ 回す</button><button class="main" data-a="drop">離す</button><button class="hold" data-r="-1">回す ⟳</button></div>
       </div>`;
     }
     if (phase === "over" && overInfo) {
@@ -741,10 +752,13 @@ ui.addEventListener("click", e => {
   else if (a === "left") moveSlot(-1);
   else if (a === "right") moveSlot(1);
   else if (a === "drop") dropHeld();
-  else if (a === "turn") turnHeld();
   else if (a === "quit") { if (confirm("ゲームをやめてメニューに戻りますか？")) backToMenu(); }
   else if (a === "back") backToMenu();
 });
+// 回転ボタンは押している間だけ回る
+ui.addEventListener("pointerdown", e => { const b = e.target.closest("[data-r]"); if (b) { rotHold = +b.dataset.r; e.preventDefault(); } });
+for (const ev of ["pointerup", "pointercancel"]) addEventListener(ev, () => { rotHold = 0; });
+ui.addEventListener("contextmenu", e => { if (e.target.closest("[data-r]")) e.preventDefault(); });   // 長押しでメニューが出ないように
 function backToMenu() { cleanupNet(); mode = null; screen = "menu"; phase = "idle"; errMsg = ""; renderUI(); }
 
 // ================= ループ =================
@@ -771,10 +785,10 @@ window.__jenga = {
   shown: i => [...tgtPos[i].toArray(), viewSel], get moves() { return moves; }, bodies: () => bodies, canPick,
   snap: snapshot, load: d => { applySnapshot(d); beginMyTurn(); }, build: s => { buildTower(s); beginMyTurn(); },
   set: o => { if (o.JITTER != null) JITTER = o.JITTER; if (o.HVAR != null) HVAR = o.HVAR; if (o.FRICTION != null) FRICTION = o.FRICTION; },
-  tap: tapBlock, drop: dropHeld, moveSlot, turn: turnHeld, step: n => { for (let i = 0; i < n && ACTIVE.includes(phase); i++) physStep(); syncMeshesFromBodies(true); },
+  tap: tapBlock, drop: dropHeld, moveSlot, rot: v => { rotHold = v; }, step: n => { for (let i = 0; i < n && ACTIVE.includes(phase); i++) physStep(); syncMeshesFromBodies(true); },
   get place() { return place; }, get cam() { return cam; },
   raw: n => { for (let i = 0; i < n; i++) world.step(); syncMeshesFromBodies(true); },
-  pull: t => { if (sel >= 0) drag = { axis: axisOf(sel), off0: 0, target: t, dir: { x: 1, y: 0 }, ppu: 50, sx: 0, sy: 0 }; },
+  pull: t => { if (sel >= 0) drag = { axis: axisOf(sel), off0: 0, target: t, ty: null, A: { x: 50, y: 0 }, U: { x: 0, y: -50 }, det: 0, sx: 0, sy: 0 }; },
 };
 </script>
 </body>
