@@ -47,6 +47,10 @@
   .order span.on { background:var(--accent); color:#2a1a05; font-weight:700; }
   .toast { position:absolute; left:50%; top:42%; transform:translate(-50%,-50%); background:rgba(10,12,18,.9); padding:12px 18px; border-radius:12px; font-size:15px; white-space:nowrap; pointer-events:none; }
   .big { font-size:30px; font-weight:900; text-align:center; margin:4px 0 10px; }
+  .seg { display:flex; gap:6px; }
+  .seg button { margin-top:0; padding:10px 4px; }
+  .seg button.on { background:var(--accent); color:#2a1a05; }
+  .diffnote { font-size:12px; color:var(--sub); margin-top:6px; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }</script>
@@ -68,7 +72,7 @@ const GRAV = -25;                  // 重力（見ためが軽すぎないよう
 const DT = 1 / 120;                // 物理の 1 ステップ
 let HVAR = 0.03;                 // ブロックの高さのばらつき（±3%）。高いブロックが重さを受け、低いブロックはゆるくなる
 let FRICTION = 0.45;
-const LIFT_MAX = 0.2;               // 押す・引くときに、指の上下でブロックを上下できる幅（元の高さから ±）。上下にゆらすとタワーも揺れる
+let LIFT_MAX = 0.2;               // 押す・引くときに、指の上下でブロックを上下できる幅（元の高さから ±）。上下にゆらすとタワーも揺れる
 const ROT_SPEED = 50 * Math.PI / 180;   // 置くときの回転ボタンを押している間の回る速さ（1秒あたり）
 const FINGER_VMAX = 25;             // 指についていく速さの上限（1秒あたり）。ふつうに動かすぶんには指とぴったり同じに動く
 let JITTER = 0.08;                 // 最初に積むときのずれ（長さ方向）。きっちりそろっていないぶん崩れやすい
@@ -76,6 +80,17 @@ const FALL_DROP = 0.75 * BH;       // ターン開始時からこれ以上下が
 const SNAP_MS = 80;                // 動きを送る間隔
 const PREFIX = "jenga-online-room-";
 const MAX_PLAYERS = 4;
+// 倒れやすさ（難易度）。部屋ごとにホストが決め、開始のときに全員へ送る
+const DIFFS = {
+  s: { label: "小", HVAR: 0.025, JITTER: 0.02, FRICTION: 0.55, LIFT: 0.15, note: "ブロックがきっちりそろっていて、すべりにくい" },
+  m: { label: "中", HVAR: 0.03, JITTER: 0.08, FRICTION: 0.45, LIFT: 0.2, note: "ふつう" },
+  l: { label: "大", HVAR: 0.04, JITTER: 0.14, FRICTION: 0.36, LIFT: 0.25, note: "ずれが大きく、すべりやすい。ゆすると揺れが大きい" },
+};
+let diff = "m";
+function applyDiff(k) {
+  const d = DIFFS[k] || DIFFS.m; diff = DIFFS[k] ? k : "m";
+  HVAR = d.HVAR; JITTER = d.JITTER; FRICTION = d.FRICTION; LIFT_MAX = d.LIFT;
+}
 const ACTIVE = ["pull", "carry", "place", "settle", "fallen"];   // 自分が物理を動かしている間
 
 // ================= 3D 表示 =================
@@ -98,7 +113,7 @@ scene.add(sun);
 // カメラ側から当てる弱い光（影の側のブロックも見えるように）
 const fill = new THREE.DirectionalLight(0xffffff, 0.75);
 scene.add(fill); scene.add(fill.target);
-const table = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, 0.4, 48), new THREE.MeshStandardMaterial({ color: 0x4a3322, roughness: 0.9 }));
+const table = new THREE.Mesh(new THREE.CylinderGeometry(15, 15, 0.4, 64), new THREE.MeshStandardMaterial({ color: 0x4a3322, roughness: 0.9 }));
 table.position.y = -0.2; table.receiveShadow = true; scene.add(table);
 
 function woodTexture() {
@@ -371,7 +386,7 @@ function physStep() {
   if (phase === "fallen" && phaseT > 2.5) { phase = "wait"; send({ t: "fall", d: snapshot() }); return; }
   const now = performance.now();   // 見ている人へ今の位置を送る
   if (mode !== "local" && now - lastSend > SNAP_MS && ACTIVE.includes(phase)) {
-    lastSend = now; send({ t: "snap", d: snapshot(), s: sel >= 0 ? sel : held });
+    lastSend = now; send({ t: "snap", d: snapshot(), s: sel >= 0 ? sel : held, ph: phase, yaw: +cam.yaw.toFixed(3) });
   }
 }
 function checkFallen() {
@@ -546,19 +561,20 @@ function bcast(m, except) {
   for (const [id, c] of host.conns) if (id !== except && c.open) { try { c.send(m); } catch (e) {} }
   if (except !== 0) onMsg(m);
 }
-function hostLobby() { lobby = [{ id: 0, name: myName() }, ...[...host.conns.keys()].map(id => ({ id, name: host.conns.get(id).pname }))]; bcast({ t: "lobby", players: lobby }); }
+function hostLobby() { lobby = [{ id: 0, name: myName() }, ...[...host.conns.keys()].map(id => ({ id, name: host.conns.get(id).pname }))]; bcast({ t: "lobby", players: lobby, diff }); }
 function hostStart() {
   host.playing = true; host.turnI = 0; host.n = 0; host.last = null;
   const ps = mode === "local" ? players : lobby.slice();
   const ord = ps.map(p => p.id);
   for (let i = ord.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [ord[i], ord[j]] = [ord[j], ord[i]]; }
   if (mode === "local") ord.sort((a, b) => a - b);
-  bcast({ t: "start", seed: (Math.random() * 2 ** 31) | 0, players: ps, order: ord });
+  bcast({ t: "start", seed: (Math.random() * 2 ** 31) | 0, players: ps, order: ord, diff });
   bcast({ t: "turn", cur: ord[0], d: null, n: 0 });
 }
 function hostHandle(from, m) {
   if (m.t === "hello") return;
   if (!host.playing) return;
+  if (m.t === "look") { bcast({ t: "look", id: from, yaw: m.yaw }, from); return; }
   const cur = order[host.turnI % order.length];
   if (from !== cur) return;
   if (m.t === "snap") { host.last = m.d; bcast(m, from); }
@@ -587,24 +603,37 @@ function onMsg(m) {
   switch (m.t) {
     case "welcome": myId = m.you; screen = "lobby"; break;
     case "reject": errMsg = m.why; screen = "menu"; cleanupNet(); break;
-    case "lobby": lobby = m.players; break;
-    case "start":
+    case "lobby": lobby = m.players; if (m.diff) diff = m.diff; break;
+    case "start": {
       players = m.players; order = m.order; overInfo = null;
-      buildTower(m.seed); screen = "game"; phase = "watch"; viewSel = -1;
-      Object.assign(cam, { yaw: 0.65, dist: 18, ty: 5 });
+      applyDiff(m.diff); buildTower(m.seed); screen = "game"; phase = "watch"; viewSel = -1;
+      // オンラインでは、最初の視点を人ごとにずらす（テーブルのまわりに散らばって立つ）
+      const me = mode === "local" ? 0 : Math.max(0, players.findIndex(p => p.id === myId));
+      Object.assign(cam, { yaw: 0.65 + me * spreadAngle(), dist: 18, ty: 5, pitch: 0.28 });
+      buildAvatars();
       break;
-    case "order": order = m.order; break;
+    }
+    case "order": {
+      order = m.order;
+      const a = avatars.get(m.left);
+      if (a) { for (const o of [a.g, a.arm, a.hand]) scene.remove(o); avatars.delete(m.left); }
+      break;
+    }
     case "turn":
       if (viewSel >= 0) setHighlight(viewSel, false); viewSel = -1;
-      curId = m.cur; moves = m.n;
+      curId = m.cur; moves = m.n; activeInfo = null;
       if (m.d) applySnapshot(m.d);
       if (isMine()) beginMyTurn(); else phase = "watch";
       break;
-    case "snap":
+    case "look": { const a = avatars.get(m.id); if (a) a.tyaw = m.yaw; return; }
+    case "snap": {
       if (isMine() || screen !== "game") return;
       setTargets(m.d);
+      activeInfo = { ph: m.ph, s: m.s };
+      const a = avatars.get(curId); if (a && m.yaw != null) a.tyaw = m.yaw;
       if (m.s !== viewSel) { setHighlight(viewSel, false); viewSel = m.s; setHighlight(viewSel, true); }
       return;
+    }
     case "over":
       setHighlight(viewSel, false); viewSel = -1;
       phase = "over"; overInfo = m; moves = m.n;
@@ -666,12 +695,17 @@ function startLocal(n) {
 const ui = document.getElementById("ui");
 const esc = t => String(t).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+diff = DIFFS[store.get("jenga-diff")] ? store.get("jenga-diff") : "m";
 let meName = "";
 function myName() { if (meName) return meName; return (document.getElementById("name")?.value || store.get("jenga-name") || "ゲスト").trim().slice(0, 12) || "ゲスト"; }
 function fixName() { meName = ""; meName = myName(); store.set("jenga-name", meName); }
 const urlRoom = new URLSearchParams(location.search).get("room") || "";
 function shareUrl() { const u = new URL(location.href); u.search = "?room=" + host.code + "&openExternalBrowser=1"; u.hash = ""; return u.toString(); }
 
+function diffSeg(canEdit) {
+  return `<div class="seg">${Object.entries(DIFFS).map(([k, d]) => `<button class="${k === diff ? "on" : ""}" ${canEdit ? `data-a="diff-${k}"` : "disabled"}>${d.label}</button>`).join("")}</div>
+    <div class="diffnote">${esc(DIFFS[diff].note)}</div>`;
+}
 function renderUI() {
   let h = "";
   if (screen === "menu") {
@@ -682,6 +716,7 @@ function renderUI() {
       <label>部屋番号で入る</label>
       <div class="row"><input id="code" inputmode="numeric" maxlength="4" placeholder="1234" value="${esc(urlRoom)}"><button class="blue" data-a="join" style="margin-top:0">入る</button></div>
       <div class="sep"></div>
+      <label>倒れやすさ（部屋を作るとき・この端末で遊ぶとき）</label>${diffSeg(true)}
       <button data-a="solo">ひとりで練習</button>
       <div class="row"><button data-a="local2">2人で交代</button><button data-a="local3">3人</button><button data-a="local4">4人</button></div>
       ${errMsg ? `<div class="err">${esc(errMsg)}</div>` : ""}
@@ -694,6 +729,7 @@ function renderUI() {
       <p class="lead" style="margin:0">部屋番号</p><div class="code">${esc(host.code || "")}</div>
       <button class="blue" data-a="share">招待リンクを送る</button>
       <ul class="players">${lobby.map(p => `<li><span>${esc(p.name)}${p.id === myId ? "（あなた）" : ""}</span><span style="color:var(--sub)">${p.id === 0 ? "ホスト" : ""}</span></li>`).join("")}</ul>
+      <label>倒れやすさ${mode === "host" ? "" : "（ホストが決めます）"}</label>${diffSeg(mode === "host")}
       ${mode === "host" ? `<button class="main" data-a="start" ${lobby.length < 2 ? "disabled" : ""}>${lobby.length < 2 ? "参加者を待っています…" : `${lobby.length}人で始める`}</button>`
         : `<p class="lead" style="margin-top:12px">ホストが始めるのを待っています…</p>`}
       <button data-a="back">ぬける</button>
@@ -713,7 +749,7 @@ function renderUI() {
     h = `<div class="hud p"><div class="who"><div class="turn ${mine ? "me" : ""}">${turnTxt}</div>
         <div class="hint">${hints[phase] || ""}</div>
         ${order.length > 1 ? `<div class="order">${order.map(id => `<span class="${id === curId && phase !== "over" ? "on" : ""}">${esc(nameOf(id))}</span>`).join("")}</div>` : ""}</div>
-      <div class="cnt">ターン<b>${moves}</b></div><button class="x" data-a="quit">✕</button></div>`;
+      <div class="cnt">ターン<b>${moves}</b>倒れやすさ ${DIFFS[diff].label}</div><button class="x" data-a="quit">✕</button></div>`;
     if (mine && phase === "place") {
       h += `<div class="bottom p" style="flex-direction:column">
         <div class="row"><button data-a="left">◀ 置き場</button><button data-a="right">置き場 ▶</button></div>
@@ -743,6 +779,7 @@ ui.addEventListener("click", e => {
   else if (a === "solo") { fixName(); startLocal(1); }
   else if (a.startsWith("local")) startLocal(+a.slice(5));
   else if (a === "start") hostStart();
+  else if (a.startsWith("diff-")) { diff = a.slice(5); store.set("jenga-diff", diff); if (mode === "host" && screen === "lobby") hostLobby(); else { for (const b of document.querySelectorAll(".seg button")) b.classList.toggle("on", b.dataset.a === "diff-" + diff); const n = document.querySelector(".diffnote"); if (n) n.textContent = DIFFS[diff].note; } }
   else if (a === "again") { if (mode === "local") hostStart(); else if (mode === "host") hostStart(); }
   else if (a === "share") {
     const url = shareUrl();
@@ -759,7 +796,127 @@ ui.addEventListener("click", e => {
 ui.addEventListener("pointerdown", e => { const b = e.target.closest("[data-r]"); if (b) { rotHold = +b.dataset.r; e.preventDefault(); } });
 for (const ev of ["pointerup", "pointercancel"]) addEventListener(ev, () => { rotHold = 0; });
 ui.addEventListener("contextmenu", e => { if (e.target.closest("[data-r]")) e.preventDefault(); });   // 長押しでメニューが出ないように
-function backToMenu() { cleanupNet(); mode = null; screen = "menu"; phase = "idle"; errMsg = ""; renderUI(); }
+function backToMenu() { cleanupNet(); clearAvatars(); mode = null; screen = "menu"; phase = "idle"; errMsg = ""; renderUI(); }
+
+// ================= ほかのプレイヤー（オンラインのとき）=================
+// テーブルのまわりに、ほかの人の姿と名前を出す。立つ場所は、その人が見ている向き（カメラの向き）。
+// 番の人が引いているときは、腕を伸ばしてブロックの手前の端を指でつまむ。置くときは上からつまむ。
+const AV_R = 5.2;    // テーブルの中心から立つ場所まで（スマホの縦長の画面にも入るよう、タワーの近く）
+const AV_SCALE = 0.8; // 人の大きさ
+const LOOKS = [   // 人ごとの見た目（部屋に入った順）
+  { body: 0xe0533d, skin: 0xf2c9a0, hair: 0x3b2a20, hat: "cap", hatC: 0x2b59c3, pants: 0x2d3446 },
+  { body: 0x3d9be0, skin: 0xe9b98f, hair: 0xe8c25a, hat: "none", hatC: 0, pants: 0x4a3a2a },
+  { body: 0x58b85c, skin: 0xc98d64, hair: 0x1d1d1d, hat: "beanie", hatC: 0xf0b25a, pants: 0x30343c },
+  { body: 0x9b59d0, skin: 0xf5d5b8, hair: 0xb04a2a, hat: "crown", hatC: 0xf5c542, pants: 0x3a2f4a },
+];
+const avatars = new Map();   // id → アバター
+// 最初に立つ向きの間隔（2〜3人なら120度、4人なら90度。真向かいだとタワーに隠れるので）
+const spreadAngle = () => Math.min(Math.PI * 2 / Math.max(1, players.length), Math.PI * 2 / 3);
+let activeInfo = null;       // 番の人の { ph, s }（snap で届く）
+function nameSprite(name, on) {
+  const c = document.createElement("canvas"); c.width = 512; c.height = 128;
+  const g = c.getContext("2d");
+  g.fillStyle = on ? "rgba(240,178,90,.95)" : "rgba(16,19,27,.8)";
+  g.beginPath(); g.roundRect(8, 16, 496, 96, 48); g.fill();
+  g.fillStyle = on ? "#2a1a05" : "#ffffff"; g.font = "bold 56px system-ui, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(name, 256, 66, 470);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function makeAvatar(p, idx) {
+  const L = LOOKS[idx % LOOKS.length], mats = [];
+  const mat = c => { const m = new THREE.MeshStandardMaterial({ color: c, roughness: 0.7, transparent: true }); mats.push(m); return m; };
+  const g = new THREE.Group();
+  const add = (geo, m, x, y, z) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); g.add(o); return o; };
+  const skin = mat(L.skin), body = mat(L.body), pants = mat(L.pants), hair = mat(L.hair), dark = mat(0x1a1a1a);
+  for (const x of [-0.6, 0.6]) { add(new THREE.CylinderGeometry(0.45, 0.42, 3, 12), pants, x, 1.5, 0); add(new THREE.SphereGeometry(0.5, 12, 8), dark, x, 0.2, 0.25).scale.set(1, 0.6, 1.4); }
+  add(new THREE.CylinderGeometry(1.15, 1.35, 3.3, 16), body, 0, 4.6, 0);
+  add(new THREE.SphereGeometry(1.15, 16, 10), body, 0, 6.2, 0).scale.set(1, 0.45, 0.85);   // 肩
+  add(new THREE.CylinderGeometry(0.4, 0.45, 0.6, 10), skin, 0, 6.6, 0);   // 首
+  add(new THREE.SphereGeometry(1.3, 20, 14), skin, 0, 7.9, 0);   // 頭
+  add(new THREE.SphereGeometry(1.36, 20, 10, 0, Math.PI * 2, 0, Math.PI * 0.45), hair, 0, 8.0, -0.05);   // 髪
+  for (const x of [-0.45, 0.45]) add(new THREE.SphereGeometry(0.17, 8, 6), dark, x, 8.0, 1.18);   // 目
+  add(new THREE.BoxGeometry(0.5, 0.08, 0.05), dark, 0, 7.45, 1.25);   // 口
+  if (L.hat === "cap") { add(new THREE.SphereGeometry(1.4, 20, 10, 0, Math.PI * 2, 0, Math.PI * 0.42), mat(L.hatC), 0, 8.2, 0); add(new THREE.BoxGeometry(1.6, 0.12, 1.2), mats.at(-1), 0, 8.75, 1.2); }
+  if (L.hat === "beanie") { add(new THREE.SphereGeometry(1.42, 20, 10, 0, Math.PI * 2, 0, Math.PI * 0.5), mat(L.hatC), 0, 8.1, 0); add(new THREE.SphereGeometry(0.35, 10, 8), mats.at(-1), 0, 9.6, 0); }
+  if (L.hat === "crown") { const cm = mat(L.hatC); add(new THREE.CylinderGeometry(0.9, 0.9, 0.5, 5, 1, true), cm, 0, 9.45, 0); for (let i = 0; i < 5; i++) { const a = i / 5 * Math.PI * 2; add(new THREE.ConeGeometry(0.22, 0.5, 6), cm, Math.sin(a) * 0.85, 9.95, Math.cos(a) * 0.85); } }
+  const armL = add(new THREE.CylinderGeometry(0.33, 0.3, 2.8, 10), body, -1.5, 4.7, 0);   // 左腕（下ろしたまま）
+  add(new THREE.SphereGeometry(0.42, 10, 8), skin, -1.5, 3.2, 0);
+  // 右腕と手はシーンに直接置き、毎フレーム肩から手の位置まで伸ばす
+  const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 1, 10), body);
+  const hand = new THREE.Mesh(new THREE.SphereGeometry(0.42, 12, 10), skin);
+  const finger = new THREE.Mesh(new THREE.CapsuleGeometry(0.14, 0.5, 4, 8), skin);
+  hand.add(finger); finger.position.set(0, 0, 0.45); finger.rotation.x = Math.PI / 2;
+  scene.add(arm); scene.add(hand);
+  const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: nameSprite(p.name, false), transparent: true, depthWrite: false }));
+  label.scale.set(5, 1.25, 1); label.position.set(0, 11.2, 0); g.add(label);
+  g.scale.setScalar(AV_SCALE); scene.add(g);
+  const yaw = 0.65 + idx * spreadAngle();
+  const a = { id: p.id, name: p.name, g, arm, hand, label, mats: [...mats, label.material], yaw, tyaw: yaw, on: false,
+    handPos: new THREE.Vector3(), handDir: new THREE.Vector3(0, -1, 0), texOff: label.material.map, texOn: null };
+  a.handPos.copy(restHand(a));
+  avatars.set(p.id, a);
+}
+function clearAvatars() {
+  for (const a of avatars.values()) {
+    for (const o of [a.g, a.arm, a.hand]) { scene.remove(o); o.traverse(c => c.geometry?.dispose()); }
+    for (const m of a.mats) { m.map?.dispose(); m.dispose(); }
+    a.texOn?.dispose();
+  }
+  avatars.clear(); activeInfo = null;
+}
+function buildAvatars() {
+  clearAvatars();
+  if (mode === "local") return;
+  players.forEach((p, i) => { if (p.id !== myId) makeAvatar(p, i); });
+}
+const shoulderOf = a => a.g.localToWorld(new THREE.Vector3(1.5, 6.0, 0.1));
+const restHand = a => a.g.localToWorld(new THREE.Vector3(1.6, 3.2, 0.3));
+const angDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+function updateAvatars() {
+  for (const a of avatars.values()) {
+    a.yaw += angDiff(a.tyaw, a.yaw) * 0.12;
+    a.g.position.set(Math.sin(a.yaw) * AV_R, 0, Math.cos(a.yaw) * AV_R);
+    a.g.lookAt(0, 0, 0);
+    // 番の人の名札を光らせる
+    const on = a.id === curId && phase !== "over";
+    if (on !== a.on) {
+      a.on = on;
+      if (on && !a.texOn) a.texOn = nameSprite(a.name, true);
+      a.label.material.map = on ? a.texOn : a.texOff; a.label.material.needsUpdate = true;
+    }
+    // 手の行き先
+    let tgt = restHand(a), dir = new THREE.Vector3(0, -1, 0);
+    const info = on ? activeInfo : null;
+    if (info && info.s >= 0 && meshes[info.s]) {
+      const m = meshes[info.s], c = m.position, ax = new THREE.Vector3(1, 0, 0).applyQuaternion(m.quaternion);
+      if (info.ph === "pull") {   // 自分に近いほうの端をつまむ
+        const sg = Math.sign(ax.dot(a.g.position.clone().sub(c))) || 1;
+        tgt = c.clone().addScaledVector(ax, sg * (BL / 2 + 0.35));
+        dir = ax.clone().multiplyScalar(-sg);
+      } else if (info.ph === "carry" || info.ph === "place") {   // 上からつまむ
+        tgt = c.clone().add(new THREE.Vector3(0, heights[info.s] / 2 + 0.45, 0));
+      }
+    }
+    a.handPos.lerp(tgt, 0.25); a.handDir.lerp(dir, 0.25).normalize();
+    const sh = shoulderOf(a), v = a.handPos.clone().sub(sh), len = Math.max(0.01, v.length());
+    a.arm.position.copy(sh).addScaledVector(v, 0.5);
+    a.arm.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), v.clone().divideScalar(len));
+    a.arm.scale.set(1, len, 1);
+    a.hand.position.copy(a.handPos);
+    a.hand.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), a.handDir);
+    // 自分の視点のすぐ前に立っている人は、透けさせる（タワーが見えなくならないように）
+    const op = Math.abs(angDiff(a.yaw, cam.yaw)) < 0.45 ? 0.18 : 1;
+    for (const m of a.mats) m.opacity = op;
+  }
+}
+// 自分の見ている向きを、ほかの人へときどき知らせる（番の人は snap で送っている）
+let lookSent = 0, lookYaw = 99;
+function sendLook(now) {
+  if (mode === "local" || !mode || screen !== "game" || (isMine() && ACTIVE.includes(phase))) return;
+  if (now - lookSent < 400 || Math.abs(angDiff(cam.yaw, lookYaw)) < 0.05) return;
+  lookSent = now; lookYaw = cam.yaw; send({ t: "look", yaw: +cam.yaw.toFixed(3) });
+}
 
 // ================= ループ =================
 let acc = 0, last = performance.now();
@@ -773,6 +930,7 @@ function frame(now) {
     syncMeshesFromBodies(true);
   } else if (screen === "game") { acc = 0; if (!isMine() || phase === "over") lerpMeshes(); }
   updateCamera(); updateXray();
+  if (screen === "game") { updateAvatars(); sendLook(now); }
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
@@ -786,7 +944,8 @@ window.__jenga = {
   snap: snapshot, load: d => { applySnapshot(d); beginMyTurn(); }, build: s => { buildTower(s); beginMyTurn(); },
   set: o => { if (o.JITTER != null) JITTER = o.JITTER; if (o.HVAR != null) HVAR = o.HVAR; if (o.FRICTION != null) FRICTION = o.FRICTION; },
   tap: tapBlock, drop: dropHeld, moveSlot, rot: v => { rotHold = v; }, step: n => { for (let i = 0; i < n && ACTIVE.includes(phase); i++) physStep(); syncMeshesFromBodies(true); },
-  get place() { return place; }, get cam() { return cam; },
+  get place() { return place; }, get cam() { return cam; }, avatars: () => avatars, get diff() { return diff; },
+  render: n => { for (let i = 0; i < (n || 1); i++) { if (!isMine()) lerpMeshes(); updateCamera(); updateXray(); updateAvatars(); } renderer.render(scene, camera); },
   raw: n => { for (let i = 0; i < n; i++) world.step(); syncMeshesFromBodies(true); },
   pull: t => { if (sel >= 0) drag = { axis: axisOf(sel), off0: 0, target: t, ty: null, A: { x: 50, y: 0 }, U: { x: 0, y: -50 }, det: 0, sx: 0, sy: 0 }; },
 };
